@@ -946,6 +946,8 @@ store._ddl['configvar'],
     block_nNonce  NUMERIC(10),
     block_height  NUMERIC(14) NULL,
     prev_block_id NUMERIC(14) NULL,
+    prev_block_hash BIT(256) NULL,
+    total_fee NUMERIC(30) NULL,
     search_block_id NUMERIC(14) NULL,
     block_chain_work BIT(""" + str(WORK_BITS) + """),
     block_value_in NUMERIC(30) NULL,
@@ -955,12 +957,14 @@ store._ddl['configvar'],
     block_satoshi_seconds NUMERIC(28) NULL,
     block_total_ss NUMERIC(28) NULL,
     block_num_tx  NUMERIC(10) NOT NULL,
+    block_size    NUMERIC(10),
     block_ss_destroyed NUMERIC(28) NULL,
     FOREIGN KEY (prev_block_id)
         REFERENCES block (block_id),
     FOREIGN KEY (search_block_id)
         REFERENCES block (block_id)
 )""",
+"""CREATE INDEX x_block ON block (block_hash)""",
 
 # CHAIN comprises a magic number, a policy, and (indirectly via
 # CHAIN_LAST_BLOCK_ID and the referenced block's ancestors) a genesis
@@ -1021,6 +1025,7 @@ store._ddl['configvar'],
     tx_lockTime   NUMERIC(10),
     tx_size       NUMERIC(10)
 )""",
+"""CREATE INDEX x_tx ON tx (tx_hash)""",
 
 # Presence of transactions in blocks is many-to-many.
 """CREATE TABLE block_tx (
@@ -1035,14 +1040,35 @@ store._ddl['configvar'],
         REFERENCES tx (tx_id)
 )""",
 """CREATE INDEX x_block_tx_tx ON block_tx (tx_id)""",
+"""CREATE INDEX x_block_tx_block ON block_tx (block_id)""",
 
 # A public key for sending bitcoins.  PUBKEY_HASH is derivable from a
 # Bitcoin or Testnet address.
 """CREATE TABLE pubkey (
     pubkey_id     NUMERIC(26) NOT NULL PRIMARY KEY,
     pubkey_hash   BIT(160)    UNIQUE NOT NULL,
+    address       VARCHAR(34) UNIQUE NOT NULL,
+    received      NUMERIC(30) NULL,
+    sent          NUMERIC(30) NULL,
+    n_tx          NUMERIC(10) NULL,
     pubkey        BIT(520)    NULL
 )""",
+"""CREATE INDEX x_pubkey ON pubkey (pubkey_hash)""",
+"""CREATE INDEX x_pubkey_add ON pubkey (address)""",
+
+
+#Table for quickly getting txs for an address
+"""CREATE TABLE pubkey_tx (
+    pubkey_id     NUMERIC(26) NOT NULL,
+    tx_id         NUMERIC(26) NOT NULL,
+    PRIMARY KEY (pubkey_id, tx_id),
+    FOREIGN KEY (pubkey_id)
+        REFERENCES pubkey (pubkey_id),
+    FOREIGN KEY (tx_id)
+        REFERENCES tx (tx_id)
+""",
+"""CREATE INDEX x_pubkey_tx ON pubkey_tx (pubkey_id)""",
+
 
 # A transaction out-point.
 """CREATE TABLE txout (
@@ -1052,13 +1078,18 @@ store._ddl['configvar'],
     txout_value   NUMERIC(30) NOT NULL,
     txout_scriptPubKey BIT VARYING(80000),
     pubkey_id     NUMERIC(26),
+    address       VARCHAR(34),
+    address_tag   VARCHAR(1000) NULL,
+    address_tag_link   VARCHAR(1000) NULL,
     UNIQUE (tx_id, txout_pos),
     FOREIGN KEY (pubkey_id)
         REFERENCES pubkey (pubkey_id)
 )""",
 """CREATE INDEX x_txout_pubkey ON txout (pubkey_id)""",
+"""CREATE INDEX x_txout_tx ON txout (tx_id)""",
 
 # A transaction in-point.
+# Duplicates some fields of txout, this is for speed up of requests.
 """CREATE TABLE txin (
     txin_id       NUMERIC(26) NOT NULL PRIMARY KEY,
     tx_id         NUMERIC(26) NOT NULL,
@@ -1066,11 +1097,16 @@ store._ddl['configvar'],
     txout_id      NUMERIC(26)""" + (""",
     txin_scriptSig BIT VARYING(80000),
     txin_sequence NUMERIC(10)""" if store.keep_scriptsig else "") + """,
+    txout_pos     NUMERIC(10),
+    txout_value   NUMERIC(30),
+    txout_address VARCHAR(34),
+    txout_tx_id   NUMERIC(26),
     UNIQUE (tx_id, txin_pos),
     FOREIGN KEY (tx_id)
         REFERENCES tx (tx_id)
 )""",
 """CREATE INDEX x_txin_txout ON txin (txout_id)""",
+"""CREATE INDEX x_txin_tx ON txin (tx_id)""",
 
 # While TXIN.TXOUT_ID can not be found, we must remember TXOUT_POS,
 # a.k.a. PREVOUT_N.
