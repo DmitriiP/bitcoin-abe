@@ -1097,10 +1097,10 @@ store._ddl['configvar'],
     txout_id      NUMERIC(26)""" + (""",
     txin_scriptSig BIT VARYING(80000),
     txin_sequence NUMERIC(10)""" if store.keep_scriptsig else "") + """,
-    txout_pos     NUMERIC(10),
-    txout_value   NUMERIC(30),
-    txout_address VARCHAR(34),
-    txout_tx_id   NUMERIC(26),
+    txout_pos     NUMERIC(10) NULL,
+    txout_value   NUMERIC(30) NULL,
+    txout_address VARCHAR(34) NULL,
+    txout_tx_id   NUMERIC(26) NULL,
     UNIQUE (tx_id, txin_pos),
     FOREIGN KEY (tx_id)
         REFERENCES tx (tx_id)
@@ -1653,6 +1653,7 @@ store._ddl['txout_approx'],
         b['value_in'] = 0
         b['value_out'] = 0
         b['value_destroyed'] = 0
+        b['size'] = 0
         tx_hash_array = []
 
         # In the common case, all the block's txins _are_ linked, and we
@@ -1682,6 +1683,7 @@ store._ddl['txout_approx'],
                 b['value_in'] += tx['value_in']
             b['value_out'] += tx['value_out']
             b['value_destroyed'] += tx['value_destroyed']
+            b['size'] += len(tx['tx'])
 
         # Get a new block ID.
         block_id = int(store.new_id("block"))
@@ -1738,9 +1740,9 @@ store._ddl['txout_approx'],
                     prev_block_id, block_chain_work, block_value_in,
                     block_value_out, block_total_satoshis,
                     block_total_seconds, block_total_ss, block_num_tx,
-                    search_block_id
+                    search_block_id, block_size, prev_block_hash
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                 )""",
                 (block_id, store.hashin(b['hash']), store.intin(b['version']),
                  store.hashin(b['hashMerkleRoot']), store.intin(b['nTime']),
@@ -1750,7 +1752,8 @@ store._ddl['txout_approx'],
                  store.intin(b['value_in']), store.intin(b['value_out']),
                  store.intin(b['satoshis']), store.intin(b['seconds']),
                  store.intin(b['total_ss']),
-                 len(b['transactions']), b['search_block_id']))
+                 len(b['transactions']), b['search_block_id'],
+                 b['size'], b['hashPrev']))
 
         except store.module.DatabaseError:
 
@@ -2084,32 +2087,44 @@ store._ddl['txout_approx'],
         # Import transaction outputs.
         tx['value_out'] = 0
         tx['value_destroyed'] = 0
+        addresses = []  # Lets keep of addresses that were involved in tx.
         for pos in xrange(len(tx['txOut'])):
             txout = tx['txOut'][pos]
             tx['value_out'] += txout['value']
             txout_id = store.new_id("txout")
 
-            pubkey_id = store.script_to_pubkey_id(txout['scriptPubKey'])
+            pubkey_id, address = store.script_to_pubkey_id(txout['scriptPubKey'])
             if pubkey_id is not None and pubkey_id <= 0:
                 tx['value_destroyed'] += txout['value']
 
             store.sql("""
                 INSERT INTO txout (
                     txout_id, tx_id, txout_pos, txout_value,
-                    txout_scriptPubKey, pubkey_id
-                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    txout_scriptPubKey, pubkey_id, address
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
                       (txout_id, tx_id, pos, store.intin(txout['value']),
-                       store.binin(txout['scriptPubKey']), pubkey_id))
+                       store.binin(txout['scriptPubKey']), pubkey_id, address))
             for row in store.selectall("""
                 SELECT txin_id
                   FROM unlinked_txin
                  WHERE txout_tx_hash = ?
                    AND txout_pos = ?""", (dbhash, pos)):
                 (txin_id,) = row
-                store.sql("UPDATE txin SET txout_id = ? WHERE txin_id = ?",
-                          (txout_id, txin_id))
+                store.sql("""UPDATE txin SET txout_id = ?, txout_pos = ?,
+                          txout_value = ?, txout_address = ?, txout_tx_id = ?
+                          WHERE txin_id = ?""",
+                          (txout_id, pos, store.intin(txout['value']),
+                           address, tx_id, txin_id))
                 store.sql("DELETE FROM unlinked_txin WHERE txin_id = ?",
                           (txin_id,))
+
+            # Update stats of txout address
+            if pubkey_id and pubkey_id > 0:
+                store.sql("""UPDATE pubkey SET received = received + ?,
+                          n_tx = n_tx + 1
+                          WHERE pubkey_id = ?""",
+                          (store.intin(txout['value']), pubkey_id,))
+                addresses.append(pubkey_id) #Needed for n_tx and pubkey_tx table
 
         # Import transaction inputs.
         tx['value_in'] = 0
@@ -2120,6 +2135,7 @@ store._ddl['txout_approx'],
 
             if is_coinbase:
                 txout_id = None
+                txout = None
             else:
                 txout_id, value = store.lookup_txout(
                     txin['prevout_hash'], txin['prevout_n'])
@@ -2127,6 +2143,11 @@ store._ddl['txout_approx'],
                     tx['value_in'] = None
                 elif tx['value_in'] is not None:
                     tx['value_in'] += value
+                txout = store.selectrow("""SELECT txout_pos, txout_value,
+                                        address, tx_id
+                                        FROM txout WHERE txout_id = ?""",
+                                        (txout_id,))
+
 
             store.sql("""
                 INSERT INTO txin (
@@ -2147,6 +2168,25 @@ store._ddl['txout_approx'],
                     ) VALUES (?, ?, ?)""",
                           (txin_id, store.hashin(txin['prevout_hash']),
                            store.intin(txin['prevout_n'])))
+            else:
+                # We have txout, so lets populate txin with data from it
+                store.sql("""UPDATE txin SET txout_pos = ?, txout_value = ?,
+                          txout_address = ?, txout_tx_id = ?
+                          WHERE txin_id = ?""", txout + (txin_id,))
+                # TODO Ain't sure about incrementing n_tx here
+                store.sql("""UPDATE pubkey SET sent = sent + ?, n_tx = n_tx + 1
+                          WHERE address = ?""", txout[1:3])
+                addresses.append(store.selectrow("""SELECT pubkey_id
+                                                 FROM pubkey WHERE address =?""",
+                                                 (txout[1],))[0])
+
+        #Lets throw out the duplicates
+        seen = set()
+        seen_add = seen.add
+        addresses = [ x for x in addresses if x not in seen and not seen_add(x)]
+        for ad in addresses:
+            store.sql("""INSERT INTO pubkey_tx (pubkey_id, tx_id)
+                      VALUES (?, ?)""", (ad, tx_id))
 
         # XXX Could populate PUBKEY.PUBKEY with txin scripts...
         # or leave that to an offline process.  Nothing in this program
@@ -2409,7 +2449,7 @@ store._ddl['txout_approx'],
                 break
             return store.script_to_pubkey_id(script[start:])
 
-        return None
+        return None, None
 
     def pubkey_hash_to_id(store, pubkey_hash):
         return store._pubkey_id(pubkey_hash, None)
@@ -2421,17 +2461,19 @@ store._ddl['txout_approx'],
     def _pubkey_id(store, pubkey_hash, pubkey):
         dbhash = store.binin(pubkey_hash)  # binin, not hashin for 160-bit
         row = store.selectrow("""
-            SELECT pubkey_id
+            SELECT pubkey_id, address
               FROM pubkey
              WHERE pubkey_hash = ?""", (dbhash,))
         if row:
-            return row[0]
+            return row
         pubkey_id = store.new_id("pubkey")
+        address = util.hash_to_address("\x00", pubkey_hash)
         store.sql("""
-            INSERT INTO pubkey (pubkey_id, pubkey_hash, pubkey)
-            VALUES (?, ?, ?)""",
-                  (pubkey_id, dbhash, store.binin(pubkey)))
-        return pubkey_id
+            INSERT INTO pubkey (pubkey_id, pubkey_hash, pubkey, address,
+                 received, sent, n_tx)
+            VALUES (?, ?, ?, ?, 0, 0, 0)""",
+                  (pubkey_id, dbhash, store.binin(pubkey), address))
+        return pubkey_id, address
 
     def catch_up(store):
         for dircfg in store.datadirs:
