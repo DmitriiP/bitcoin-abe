@@ -1066,7 +1066,7 @@ store._ddl['configvar'],
         REFERENCES pubkey (pubkey_id),
     FOREIGN KEY (tx_id)
         REFERENCES tx (tx_id)
-""",
+)""",
 """CREATE INDEX x_pubkey_tx ON pubkey_tx (pubkey_id)""",
 
 
@@ -2168,17 +2168,19 @@ store._ddl['txout_approx'],
                     ) VALUES (?, ?, ?)""",
                           (txin_id, store.hashin(txin['prevout_hash']),
                            store.intin(txin['prevout_n'])))
-            else:
                 # We have txout, so lets populate txin with data from it
+            elif txout:
                 store.sql("""UPDATE txin SET txout_pos = ?, txout_value = ?,
                           txout_address = ?, txout_tx_id = ?
                           WHERE txin_id = ?""", txout + (txin_id,))
                 # TODO Ain't sure about incrementing n_tx here
                 store.sql("""UPDATE pubkey SET sent = sent + ?, n_tx = n_tx + 1
                           WHERE address = ?""", txout[1:3])
-                addresses.append(store.selectrow("""SELECT pubkey_id
+                pub_id = store.selectrow("""SELECT pubkey_id
                                                  FROM pubkey WHERE address =?""",
-                                                 (txout[1],))[0])
+                                                 (txout[1],))
+                if pub_id:
+                    addresses.append(pub_id[0])
 
         #Lets throw out the duplicates
         seen = set()
